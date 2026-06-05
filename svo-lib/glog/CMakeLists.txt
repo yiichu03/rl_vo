@@ -49,11 +49,19 @@ include (DetermineGflagsNamespace)
 set (CMAKE_THREAD_PREFER_PTHREAD 1)
 
 if (WITH_GFLAGS)
-  find_package (gflags)
+  if (TARGET gflags)
+    set (gflags_FOUND TRUE)
+    set (gflags_NAMESPACE gflags)
+    set (gflags_LIBRARIES gflags)
+  else (TARGET gflags)
+    find_package (gflags)
+  endif (TARGET gflags)
 
   if (gflags_FOUND)
     set (HAVE_LIB_GFLAGS 1)
-    determine_gflags_namespace (gflags_NAMESPACE)
+    if (NOT gflags_NAMESPACE)
+      determine_gflags_namespace (gflags_NAMESPACE)
+    endif (NOT gflags_NAMESPACE)
   endif (gflags_FOUND)
 endif (WITH_GFLAGS)
 
@@ -553,31 +561,33 @@ if (BUILD_TESTING)
   endif (TARGET symbolize_unittest)
 endif (BUILD_TESTING)
 
-install (TARGETS glog
-  EXPORT glog-targets
-  RUNTIME DESTINATION bin
-  PUBLIC_HEADER DESTINATION include/glog
-  LIBRARY DESTINATION lib
-  ARCHIVE DESTINATION lib)
+if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  install (TARGETS glog
+    EXPORT glog-targets
+    RUNTIME DESTINATION bin
+    PUBLIC_HEADER DESTINATION include/glog
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib)
 
-if (gflags_FOUND)
-  set (gflags_DEPENDENCY "find_dependency (gflags ${gflags_VERSION})")
-endif (gflags_FOUND)
+  if (gflags_FOUND AND gflags_VERSION)
+    set (gflags_DEPENDENCY "find_dependency (gflags ${gflags_VERSION})")
+  endif (gflags_FOUND AND gflags_VERSION)
 
-configure_package_config_file (glog-config.cmake.in
-  ${CMAKE_CURRENT_BINARY_DIR}/glog-config.cmake
-  INSTALL_DESTINATION lib/cmake/glog
-  NO_CHECK_REQUIRED_COMPONENTS_MACRO)
+  configure_package_config_file (glog-config.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/glog-config.cmake
+    INSTALL_DESTINATION lib/cmake/glog
+    NO_CHECK_REQUIRED_COMPONENTS_MACRO)
 
-write_basic_package_version_file (glog-config-version.cmake VERSION
-  ${GLOG_VERSION} COMPATIBILITY SameMajorVersion)
+  write_basic_package_version_file (glog-config-version.cmake VERSION
+    ${GLOG_VERSION} COMPATIBILITY SameMajorVersion)
 
-export (TARGETS glog NAMESPACE glog:: FILE glog-targets.cmake)
-export (PACKAGE glog)
+  export (TARGETS glog NAMESPACE glog:: FILE glog-targets.cmake)
+  export (PACKAGE glog)
 
-install (FILES
-  ${CMAKE_CURRENT_BINARY_DIR}/glog-config.cmake
-  ${CMAKE_CURRENT_BINARY_DIR}/glog-config-version.cmake
-  DESTINATION lib/cmake/glog)
+  install (FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/glog-config.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/glog-config-version.cmake
+    DESTINATION lib/cmake/glog)
 
-install (EXPORT glog-targets NAMESPACE glog:: DESTINATION lib/cmake/glog)
+  install (EXPORT glog-targets NAMESPACE glog:: DESTINATION lib/cmake/glog)
+endif (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
