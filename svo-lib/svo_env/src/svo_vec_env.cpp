@@ -1,5 +1,6 @@
 #include <svo_env/svo_vec_env.h>
 #include <opencv2/opencv.hpp>
+#include <cstdlib>
 
 namespace svo {
 
@@ -11,6 +12,12 @@ SvoVecEnv::SvoVecEnv(
   // initialization
 //  num_threads_ = 64;
   num_threads_ = 8;
+  if (const char* env_threads = std::getenv("RLVO_SVO_NUM_THREADS")) {
+    int parsed_threads = std::atoi(env_threads);
+    if (parsed_threads > 0) {
+      num_threads_ = parsed_threads;
+    }
+  }
   num_envs_ = num_envs;
   initialize_glog_ = initialize_glog;
 
@@ -60,12 +67,12 @@ void SvoVecEnv::step(pybind11::array_t<uint8_t> &input_images,
                      Ref<Vector<>> use_gt_init_pose,
                      Ref<MatrixRowMajor<>> gt_init_pose
                      ) {
+  omp_set_num_threads(num_threads_);
+
   pybind11::buffer_info buffer_info = input_images.request();
   uint8_t *data = static_cast<uint8_t *>(buffer_info.ptr);
   std::vector<ssize_t> shape = buffer_info.shape;
   Eigen::TensorMap<Eigen::Tensor<uint8_t, 4, Eigen::RowMajor>> images_tensor(data, shape[0], shape[1], shape[2], shape[3]);
-
-//  omp_set_num_threads(num_threads_);
 
 #pragma omp parallel for schedule(dynamic)
   for (int i = 0; i < this->num_envs_; i++) {
@@ -116,6 +123,8 @@ void SvoVecEnv::env_step(Ref<Vector<>> indices,
                          Ref<Vector<>> runtime,
                          Ref<Vector<>> use_gt_init_pose,
                          Ref<MatrixRowMajor<>> gt_init_pose) {
+  omp_set_num_threads(num_threads_);
+
   pybind11::buffer_info buffer_info = input_images.request();
   uint8_t *data = static_cast<uint8_t *>(buffer_info.ptr);
   std::vector<ssize_t> shape = buffer_info.shape;

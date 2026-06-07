@@ -2,6 +2,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <opencv2/opencv.hpp>
+#include <cstdlib>
+#include <cstring>
+#include <omp.h>
 
 #include "svo_env/utils.h"
 
@@ -16,6 +19,12 @@ pybind11::array_t<uint8_t> load_image_batch(const std::vector<std::string>& imag
     auto result_ptr = result.mutable_data();
 
     int num_threads = 8;
+    if (const char* env_threads = std::getenv("RLVO_IMAGE_LOAD_NUM_THREADS")) {
+        int parsed_threads = std::atoi(env_threads);
+        if (parsed_threads > 0) {
+            num_threads = parsed_threads;
+        }
+    }
     omp_set_num_threads(num_threads);
 
     #pragma omp parallel for schedule(dynamic)
