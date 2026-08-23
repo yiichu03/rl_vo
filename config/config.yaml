@@ -13,11 +13,13 @@ wandb_logging: True
 wandb_tag: <Tag>
 wandb_group: <group>
 log_path: /logs/log_voRL/training
+run_dir: null  # Optional exact output directory for reproducible batch runs.
 n_envs: 100
 seed: 0
 total_timesteps: 25e6
 
 val_interval: 10
+eval_at_start: False
 
 dataset_dir: <path>
 vo_algorithm: "SVO"

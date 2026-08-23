@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import sys
 import time
@@ -129,6 +131,28 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         )
         self.policy = self.policy.to(self.device)
 
+    def _rms_checksum(self) -> Optional[str]:
+        rms = getattr(getattr(self, "env", None), "obs_rms", None)
+        if rms is None:
+            return None
+        digest = hashlib.sha256()
+        digest.update(np.asarray(rms.mean, dtype=np.float64).tobytes())
+        digest.update(np.asarray(rms.var, dtype=np.float64).tobytes())
+        return digest.hexdigest()
+
+    def _write_local_metrics(self, payload: Dict[str, Any]) -> None:
+        """Mirror scalar W&B metrics to an audit-friendly JSONL file."""
+        log_dir = getattr(self, "log_dir", None)
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        record = dict(payload)
+        record.setdefault("iteration", int(getattr(self, "iteration", 0)))
+        record.setdefault("num_timesteps", int(getattr(self, "num_timesteps", 0)))
+        record.setdefault("wall_time_unix", time.time())
+        with open(os.path.join(log_dir, "metrics.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+
     def collect_rollouts(
         self,
         env: VecEnv,
@@ -237,15 +261,22 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
         callback.on_rollout_end()
 
+        nr_valid_states = int(rollout_buffer.valid_mask.sum())
+        valid_denominator = max(nr_valid_states, 1)
+        wandb_dir = {
+            "rollout/sum_reward": float(rollout_buffer.rewards.sum()),
+            "rollout/sum_valid_stages": nr_valid_states,
+            "rollout/ratio_valid_stages": nr_valid_states / float(rollout_buffer.valid_mask.size),
+            "rollout/mean_keyframes": float(
+                (rollout_buffer.actions[:, :, 0] * rollout_buffer.valid_mask[:, :]).sum()
+            ) / valid_denominator,
+            "rollout/iteration": int(self.iteration),
+        }
+        local_rollout = dict(wandb_dir)
+        local_rollout["event"] = "rollout"
+        local_rollout["rms_checksum"] = self._rms_checksum()
+        self._write_local_metrics(local_rollout)
         if self.wandb_logging:
-            nr_valid_states = rollout_buffer.valid_mask.sum()
-            wandb_dir = {
-                "rollout/sum_reward": rollout_buffer.rewards.sum(),
-                "rollout/sum_valid_stages": nr_valid_states,
-                "rollout/ratio_valid_stages": nr_valid_states / float(rollout_buffer.valid_mask.size),
-                "rollout/mean_keyframes": (rollout_buffer.actions[:, :, 0] * rollout_buffer.valid_mask[:, :]).sum() / nr_valid_states,
-                "rollout/iteration": self.iteration,
-            }
             self.wandb_run.log(wandb_dir)
 
 
@@ -425,6 +456,21 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             for i_dict, (key, value) in enumerate(eval_rewards_dict.items()):
                 wandb_dir["eval/mean_" + key] = (value / (nr_samples_traj + 1e-9)).mean()
             self.wandb_run.log(wandb_dir)
+
+        self._write_local_metrics(
+            {
+                "event": "official_partial_eval",
+                "eval/mean_summed_reward": float(eval_reward.mean()),
+                "eval/sum_valid_stages": float(eval_valid_stages.sum()),
+                "eval/ratio_valid_stages": float(
+                    eval_valid_stages.sum() / max(float(nr_samples_traj.sum()), 1.0)
+                ),
+                "eval/mean_keyframes": float(mean_keyframe_traj.mean()),
+                "eval/mean_ate": float(ate_traj.mean()),
+                "eval/mean_first_seq_valid_stages": float(first_subtraj_mask.sum(1).mean()),
+                "rms_checksum": self._rms_checksum(),
+            }
+        )
 
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:

@@ -1,0 +1,61 @@
+experiment: rlvo_official_tartanair_repro
+question: Does the official RL-VO PPO loop learn on its native TartanAir domain?
+
+source_base:
+  commit: f45d2bc63d37de6ea56e2a045788225b2c08a4ea
+  note: Upstream RL-VO plus container-build and thread-control engineering commits.
+
+dataset:
+  train_trajectories: 337
+  train_frames: 279987
+  validation_trajectories: 32
+  validation_frames: 26650
+  total_trajectories: 369
+  total_frames: 306637
+  camera: left grayscale monocular
+  image_size: [640, 480]
+  validation_split: dataloader/tartan_loader.py:test_split
+
+scientific_variables:
+  seeds: [0, 23]
+  total_timesteps: 25000000
+
+official_frozen_parameters:
+  algorithm: PPO
+  n_envs: 100
+  n_steps: 250
+  rollout_size: 25000
+  n_epochs: 10
+  batch_size: 25000
+  gamma: 0.6
+  gae_lambda: 0.95
+  ent_coef: 0.0025
+  vf_coef: 0.5
+  learning_rate: linear_3e-4_to_3e-5
+  clip_range: 0.2
+  action: MultiDiscrete_keyframe_2_by_grid_5
+  grid_values: [20, 25, 30, 35, 40]
+  reward:
+    align_reward: 0.01
+    keyframe_reward: 0.0001
+    traj_length: 5
+    nr_points_for_align: 3
+  rms: official_online_update_every_10_iterations
+  validation_interval_iterations: 10
+
+measurement_only_additions:
+  - deterministic validation at iteration 0
+  - local JSONL mirror of official W&B scalar metrics
+  - RMS checksum in local metrics
+  - zero-copy unified dataset view and integrity audit
+  - pybind contiguity and reset-array shape corrections
+
+preregistered_readout:
+  early_window_iterations: [0, 100]
+  late_window_iterations: [900, 1000]
+  reward_relative_gain_required: 0.05
+  maximum_ate_relative_regression: 0.05
+  maximum_coverage_drop: 0.05
+  strong_learning_signal: both seeds pass
+  suggestive_learning_signal: exactly one seed passes
+  no_reproducible_learning_signal: neither seed passes

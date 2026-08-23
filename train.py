@@ -51,7 +51,9 @@ def main(config):
     configure_random_seed(config.seed, env=env)
 
     # save the configuration and other files
-    if not config.wandb_logging:
+    if config.run_dir is not None:
+        log_dir = os.path.abspath(config.run_dir)
+    elif not config.wandb_logging:
         log_dir = os.path.join(config.log_path, datetime.now().strftime('%b%d_%H-%M-%S'))
     elif config.wandb_group is not None:
         log_dir = os.path.join(config.log_path, config.wandb_group, datetime.now().strftime('%b%d_%H-%M-%S') + '_' + config.wandb_tag)
@@ -100,6 +102,15 @@ def main(config):
         state_dict = torch.load(config.policy_path, map_location=device, weights_only=False)["state_dict"]
         model.policy.load_state_dict(state_dict, strict=False)
         model.policy.to(device)
+
+    if config.eval_at_start:
+        model.iteration = 0
+        model.evaluation_epoch(val_env)
+        if model.log_dir is not None:
+            policy_path = os.path.join(model.log_dir, "Policy")
+            os.makedirs(policy_path, exist_ok=True)
+            model.policy.save(os.path.join(policy_path, "iter_00000.pth"))
+            model.env.save_rms(os.path.join(policy_path, "iter_00000_rms.npz"))
 
     model.learn(
         total_timesteps=int(config.total_timesteps),

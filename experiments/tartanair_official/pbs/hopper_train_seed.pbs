@@ -1,0 +1,122 @@
+#!/bin/bash
+#PBS -P CFP04-SF-109
+#PBS -N rlvo_tartan
+#PBS -q auto
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120GB
+#PBS -l walltime=18:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+SOURCE_ROOT="${RLVO_SOURCE_ROOT:?Set RLVO_SOURCE_ROOT}"
+ASSET_ROOT="${RLVO_ASSET_ROOT:-/scratch/e1538633/liuyi/vio_rl_project/vio_rl}"
+EXPECTED_COMMIT="${RLVO_EXPECTED_COMMIT:?Set RLVO_EXPECTED_COMMIT}"
+BUILD_DIR="${RLVO_BUILD_DIR:?Set RLVO_BUILD_DIR}"
+DATA_SOURCE_ROOT="${RLVO_DATA_SOURCE_ROOT:?Set RLVO_DATA_SOURCE_ROOT}"
+DATA_VIEW_ROOT="${RLVO_DATA_VIEW_ROOT:?Set RLVO_DATA_VIEW_ROOT}"
+SEED="${RLVO_SEED:?Set RLVO_SEED}"
+OUT_ROOT="${RLVO_OUT_ROOT:-${ASSET_ROOT}/outputs/hpc/rl_vo/tartanair_official}"
+JOB_TAG="${PBS_JOBID:-manual}"
+JOB_TAG="${JOB_TAG%%.*}"
+OUT_DIR="${OUT_ROOT}/seed${SEED}_${JOB_TAG}"
+RUN_DIR="${OUT_DIR}/train"
+LOG_DIR="${ASSET_ROOT}/outputs/hpc/logs"
+LOG="${LOG_DIR}/rlvo_tartanair_seed${SEED}.${PBS_JOBID:-manual}.log"
+RUNNER="${ASSET_ROOT}/scripts/hpc/run_in_openvins_container.sh"
+PY_PACKAGES="${ASSET_ROOT}/.hpc_env/python/rlvo_train_cuda_pkgs"
+
+mkdir -p "$OUT_DIR" "$RUN_DIR" "$LOG_DIR"
+
+{
+  echo "date_start=$(date -Is)"
+  echo "hostname=$(hostname)"
+  echo "pbs_jobid=${PBS_JOBID:-manual}"
+  echo "purpose=official RL-VO 25M-step TartanAir reproduction seed ${SEED}"
+  echo "scientific_variable=seed only"
+  echo "resources=1 GPU, 12 CPU, 120GB, 18h"
+  echo "budget=1000 updates x 100 env x 250 steps = 25M raw environment steps"
+  echo "source_root=$SOURCE_ROOT"
+  echo "data_source_root=$DATA_SOURCE_ROOT"
+  echo "data_view_root=$DATA_VIEW_ROOT"
+  echo "build_dir=$BUILD_DIR"
+  echo "out_dir=$OUT_DIR"
+  test "$SEED" = 0 -o "$SEED" = 23
+  test "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" = "$EXPECTED_COMMIT"
+  test -z "$(git -C "$SOURCE_ROOT" status --short)"
+  git -C "$SOURCE_ROOT" diff --quiet f45d2bc63d37de6ea56e2a045788225b2c08a4ea -- svo-lib
+  test -f "$BUILD_DIR/svo_env/svo_env.cpython-310-x86_64-linux-gnu.so"
+  git -C "$SOURCE_ROOT" log -1 --oneline
+  nvidia-smi || true
+
+  BUILD_LIBRARY_PATH="$(find "$BUILD_DIR" -name '*.so*' -printf '%h\n' | sort -u | paste -sd: -)"
+  test -n "$BUILD_LIBRARY_PATH"
+  RUNTIME_PYTHONPATH="$PY_PACKAGES:$BUILD_DIR/svo_env:$SOURCE_ROOT"
+  RUNTIME_LD_LIBRARY_PATH="$SOURCE_ROOT/svo-lib/opengv/lib:$BUILD_LIBRARY_PATH:/.singularity.d/libs"
+
+  VIO_RL_SINGULARITY_NV=1 "$RUNNER" env \
+    PYTHONPATH="$RUNTIME_PYTHONPATH" \
+    LD_LIBRARY_PATH="$RUNTIME_LD_LIBRARY_PATH" \
+    python3 "$SOURCE_ROOT/experiments/tartanair_official/dataset_view.py" validate \
+      --source-root "$DATA_SOURCE_ROOT" \
+      --view-root "$DATA_VIEW_ROOT" \
+      --loader-file "$SOURCE_ROOT/dataloader/tartan_loader.py" \
+      --output "$OUT_DIR/data_audit.json" \
+      --full
+
+  VIO_RL_SINGULARITY_NV=1 "$RUNNER" env \
+    PYTHONPATH="$RUNTIME_PYTHONPATH" \
+    LD_LIBRARY_PATH="$RUNTIME_LD_LIBRARY_PATH" \
+    RLVO_SVO_NUM_THREADS=2 \
+    RLVO_IMAGE_LOAD_NUM_THREADS=2 \
+    OMP_NUM_THREADS=2 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENCV_FOR_THREADS_NUM=1 \
+    python3 "$SOURCE_ROOT/experiments/tartanair_official/smoke.py" \
+      --dataset-root "$DATA_VIEW_ROOT" \
+      --params "$SOURCE_ROOT/svo-lib/svo_env/param/tartan_train.yaml" \
+      --calibration "$DATA_VIEW_ROOT/calibration/tartan_pinhole.yaml" \
+      --steps 12
+
+  VIO_RL_SINGULARITY_NV=1 "$RUNNER" env \
+    PYTHONPATH="$RUNTIME_PYTHONPATH" \
+    LD_LIBRARY_PATH="$RUNTIME_LD_LIBRARY_PATH" \
+    WANDB_MODE="${RLVO_WANDB_MODE:-offline}" \
+    WANDB_PROJECT="${RLVO_WANDB_PROJECT:-rl-vo-tartanair-official}" \
+    WANDB_DIR="$RUN_DIR" \
+    RLVO_SVO_NUM_THREADS=8 \
+    RLVO_IMAGE_LOAD_NUM_THREADS=8 \
+    OMP_NUM_THREADS=8 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENCV_FOR_THREADS_NUM=1 \
+    python3 "$SOURCE_ROOT/train.py" \
+      run_dir="$RUN_DIR" \
+      log_path="$OUT_DIR" \
+      dataset_dir="$DATA_VIEW_ROOT" \
+      svo_params_file="$SOURCE_ROOT/svo-lib/svo_env/param/tartan_train.yaml" \
+      svo_calib_file="$DATA_VIEW_ROOT/calibration/tartan_pinhole.yaml" \
+      seed="$SEED" \
+      total_timesteps=25e6 \
+      n_envs=100 \
+      val_interval=10 \
+      eval_at_start=True \
+      wandb_logging=True \
+      wandb_tag="official-tartanair-seed${SEED}" \
+      wandb_group=official-tartanair-repro
+
+  VIO_RL_SINGULARITY_NV=1 "$RUNNER" env \
+    PYTHONPATH="$RUNTIME_PYTHONPATH" \
+    python3 "$SOURCE_ROOT/experiments/tartanair_official/summarize.py" \
+      --run-dir "$RUN_DIR" \
+      --seed "$SEED" \
+      --output "$OUT_DIR/summary.json"
+
+  test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$OUT_DIR/summary.json")" = complete
+  echo "summary_json=$OUT_DIR/summary.json"
+  echo "metrics_jsonl=$RUN_DIR/metrics.jsonl"
+  echo "wandb_dir=$RUN_DIR/wandb"
+  echo "date_end=$(date -Is)"
+} 2>&1 | tee "$LOG"
+
+echo "$LOG"

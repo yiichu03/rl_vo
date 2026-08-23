@@ -1,3 +1,4 @@
+import os
 import warnings
 from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union
 
@@ -180,12 +181,12 @@ class PPO(OnPolicyAlgorithm):
         self.wandb_group = wandb_group
         if self.wandb_logging:
             tags = ['Seed: {}'.format(seed)]
-            if self.wandb_tag is not None and self.wandb_tag is not '':
+            if self.wandb_tag is not None and self.wandb_tag != '':
                 tags.append(self.wandb_tag)
 
             agent_dict_config = omegaconf.OmegaConf.to_container(self.config.agent, resolve=True, throw_on_missing=True)
-            self.wandb_run = wandb.init(entity="<entity>",
-                                        project="vo_rl",
+            self.wandb_run = wandb.init(entity=os.environ.get("WANDB_ENTITY") or None,
+                                        project=os.environ.get("WANDB_PROJECT", "rl-vo-tartanair-official"),
                                         dir=log_dir,
                                         tags=tags,
                                         group=self.wandb_group,
@@ -312,7 +313,7 @@ class PPO(OnPolicyAlgorithm):
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
-        if self.wandb_logging and train_iter>0:
+        if train_iter > 0:
             log_dict = {"train/entropy_loss": np.mean(entropy_losses),
                         "train/policy_gradient_loss": np.mean(pg_losses),
                         "train/value_loss": np.mean(value_losses),
@@ -330,7 +331,14 @@ class PPO(OnPolicyAlgorithm):
             if self.clip_range_vf is not None:
                 log_dict["train/clip_range_vf"] = clip_range_vf
 
-            self.wandb_run.log(log_dict)
+            local_train = {
+                key: float(value) if isinstance(value, (float, np.floating)) else int(value)
+                for key, value in log_dict.items()
+            }
+            local_train["event"] = "train"
+            self._write_local_metrics(local_train)
+            if self.wandb_logging:
+                self.wandb_run.log(log_dict)
 
 
     def learn(

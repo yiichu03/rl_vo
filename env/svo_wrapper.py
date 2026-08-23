@@ -99,7 +99,14 @@ class VecSVOEnv(VecEnv):
         if not use_gt_init_poses.any():
             gt_init_poses = -np.ones([self.num_envs, 7], dtype=np.float64)
 
-        use_gt_init_poses = use_gt_init_poses.astype(np.float64)
+        # pybind11 Eigen Ref arguments must be contiguous and have stable dtypes.
+        # These conversions do not change the scientific environment contract.
+        images = np.ascontiguousarray(images, dtype=np.uint8)
+        action = np.ascontiguousarray(action, dtype=np.float64)
+        timestamps = np.ascontiguousarray(timestamps, dtype=np.float64)
+        use_RL_actions = np.ascontiguousarray(use_RL_actions, dtype=np.float64)
+        use_gt_init_poses = np.ascontiguousarray(use_gt_init_poses, dtype=np.float64)
+        gt_init_poses = np.ascontiguousarray(gt_init_poses, dtype=np.float64)
         self.env.step(images, timestamps, action, use_RL_actions, poses, observations, dones, stages, runtime,
                       use_gt_init_poses, gt_init_poses)
 
@@ -163,8 +170,11 @@ class VecSVOEnv(VecEnv):
     def reset_dones(self, dones, images, action, poses, observations, info, use_gt_initialization, gt_init_poses=None):
         dones_mask = dones.astype("bool")
         nr_resets = int(dones.sum())
-        reset_idx = np.nonzero(dones_mask)[0].astype(np.float64)
-        self.env.reset(reset_idx)
+        if nr_resets == 0:
+            return poses, observations, info
+
+        reset_idx_flat = np.nonzero(dones_mask)[0].astype(np.float64)
+        self.env.reset(reset_idx_flat)
         self.timestamps[dones_mask] = 0
         self.env_steps[dones_mask] = 0
         self.positions[dones_mask, :, :] = 0
@@ -172,35 +182,39 @@ class VecSVOEnv(VecEnv):
         self.positions_scale[dones_mask, :, :] = 0
         self.gt_positions_scale[dones_mask, :, :] = 0
         self.scale_buffer[dones_mask, :] = 0
+        reset_idx = np.ascontiguousarray(reset_idx_flat.reshape(-1, 1), dtype=np.float64)
+        reset_images = np.ascontiguousarray(images[dones_mask, :, :, :], dtype=np.uint8)
+        reset_timestamps = np.ascontiguousarray(self.timestamps[dones_mask].reshape(-1, 1), dtype=np.float64)
+        reset_action = np.ascontiguousarray(action[dones_mask], dtype=np.float64)
         reset_poses = np.zeros([nr_resets, 16], dtype=np.float64)
         reset_observations = np.zeros([nr_resets, self.agent_obs_dim], dtype=np.float64)
-        reset_dones_array = np.zeros([nr_resets], dtype=np.float64)
-        reset_stages = np.zeros([nr_resets], dtype=np.float64)
-        reset_runtime = np.zeros([nr_resets], dtype=np.float64)
-        reset_use_RL_actions = np.zeros([nr_resets], dtype=np.float64)
-        if not use_gt_initialization:
-            use_gt_init_poses = np.zeros([self.num_envs], dtype=np.float64)
-            gt_init_poses = -np.ones([self.num_envs, 7], dtype=np.float64)
+        reset_dones_array = np.zeros([nr_resets, 1], dtype=np.float64)
+        reset_stages = np.zeros([nr_resets, 1], dtype=np.float64)
+        reset_runtime = np.zeros([nr_resets, 1], dtype=np.float64)
+        reset_use_RL_actions = np.zeros([nr_resets, 1], dtype=np.float64)
+        if not use_gt_initialization or gt_init_poses is None:
+            reset_use_gt_init_poses = np.zeros([nr_resets, 1], dtype=np.float64)
+            reset_gt_init_poses = -np.ones([nr_resets, 7], dtype=np.float64)
         else:
-            use_gt_init_poses = np.zeros([self.num_envs], dtype=np.float64)
-            use_gt_init_poses[dones_mask] = True
+            reset_use_gt_init_poses = np.ones([nr_resets, 1], dtype=np.float64)
+            reset_gt_init_poses = np.ascontiguousarray(gt_init_poses[dones_mask], dtype=np.float64)
 
         self.env.env_step(reset_idx,
-                          images[dones_mask, :, :, :],
-                          self.timestamps[dones_mask],
-                          action[dones_mask],
+                          reset_images,
+                          reset_timestamps,
+                          reset_action,
                           reset_use_RL_actions,
                           reset_poses,
                           reset_observations,
                           reset_dones_array,
                           reset_stages,
                           reset_runtime,
-                          use_gt_init_poses,
-                          gt_init_poses)
+                          reset_use_gt_init_poses,
+                          reset_gt_init_poses)
 
         poses[dones_mask] = reset_poses
         observations[dones_mask] = reset_observations
-        self.svo_stages[dones_mask] = reset_stages.astype('int')
+        self.svo_stages[dones_mask] = reset_stages.reshape(-1).astype('int')
 
         return poses, observations, info
 
@@ -251,10 +265,12 @@ class VecSVOEnv(VecEnv):
         self.gt_positions_scale[new_seq_mask, :, :] = 0
         self.scale_buffer[new_seq_mask, :] = 0
         self.svo_stages[new_seq] = 1  # SVO state initialization
+        self.prev_svo_valid_stage[new_seq_mask] = False
 
         for i in range(nr_resets):
             env_id = int(reset_idx[i])
-            info[env_id]['terminal_observation'] = self.last_observations[env_id, :]
+            if self.last_observations is not None:
+                info[env_id]['terminal_observation'] = self.last_observations[env_id, :]
 
         return info
 
