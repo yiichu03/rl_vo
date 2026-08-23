@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import sys
 import time
@@ -129,6 +131,29 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         )
         self.policy = self.policy.to(self.device)
 
+    def _rms_checksum(self) -> Optional[str]:
+        env = getattr(self, "env", None)
+        rms = getattr(env, "obs_rms", None)
+        if rms is None:
+            return None
+        digest = hashlib.sha256()
+        digest.update(np.asarray(rms.mean, dtype=np.float64).tobytes())
+        digest.update(np.asarray(rms.var, dtype=np.float64).tobytes())
+        return digest.hexdigest()
+
+    def _write_local_metrics(self, payload: Dict[str, Any]) -> None:
+        """Append a JSON record without making W&B a runtime dependency."""
+        log_dir = getattr(self, "log_dir", None)
+        if not log_dir:
+            return
+        os.makedirs(log_dir, exist_ok=True)
+        record = dict(payload)
+        record.setdefault("iteration", int(getattr(self, "iteration", 0)))
+        record.setdefault("num_timesteps", int(getattr(self, "num_timesteps", 0)))
+        record.setdefault("wall_time_unix", time.time())
+        with open(os.path.join(log_dir, "metrics.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+
     def collect_rollouts(
         self,
         env: VecEnv,
@@ -161,6 +186,15 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
         callback.on_rollout_start()
 
+        feature_sum = 0.0
+        feature_count = 0
+        failure_count = 0
+        action_applied_count = 0
+        action_mismatch_count = 0
+        action_counts = np.zeros([2, 5], dtype=np.int64)
+        position_reward_sum = 0.0
+        keyframe_reward_sum = 0.0
+
         while n_steps < n_rollout_steps:
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
                 # Sample a new noise matrix
@@ -187,6 +221,26 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                     clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
             new_obs, rewards, dones, infos, valid_mask = env.step(clipped_actions, use_gt_initialization=True)
+
+            for info in infos:
+                feature_value = info.get("actual_feature_count")
+                if feature_value is not None and np.isfinite(feature_value):
+                    feature_sum += float(feature_value)
+                    feature_count += 1
+                failure_count += int(bool(info.get("tracking_failure", False)))
+                position_reward_sum += float(info.get("position_reward", 0.0))
+                keyframe_reward_sum += float(info.get("keyframe_reward", 0.0))
+                if info.get("action_applied", False):
+                    action_applied_count += 1
+                    requested = info.get("requested_action")
+                    executed = info.get("executed_action_scaled")
+                    if requested is not None:
+                        keyframe_idx, grid_idx = int(requested[0]), int(requested[1])
+                        if 0 <= keyframe_idx < 2 and 0 <= grid_idx < 5:
+                            action_counts[keyframe_idx, grid_idx] += 1
+                        expected = [float(keyframe_idx), float(20 + 5 * grid_idx)]
+                        if executed is None or not np.allclose(executed, expected):
+                            action_mismatch_count += 1
 
             self.num_timesteps += env.num_envs
 
@@ -237,15 +291,34 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
         callback.on_rollout_end()
 
+        nr_valid_states = int(rollout_buffer.valid_mask.sum())
+        valid_denominator = max(nr_valid_states, 1)
+        wandb_dir = {
+            "rollout/sum_reward": float(rollout_buffer.rewards.sum()),
+            "rollout/reward_per_valid": float(rollout_buffer.rewards.sum()) / valid_denominator,
+            "rollout/sum_valid_stages": nr_valid_states,
+            "rollout/ratio_valid_stages": nr_valid_states / float(rollout_buffer.valid_mask.size),
+            "rollout/mean_keyframes": float(
+                (rollout_buffer.actions[:, :, 0] * rollout_buffer.valid_mask[:, :]).sum()
+            ) / valid_denominator,
+            "rollout/mean_actual_features": feature_sum / max(feature_count, 1),
+            "rollout/tracking_failures": failure_count,
+            "rollout/action_applied_count": action_applied_count,
+            "rollout/action_mismatch_count": action_mismatch_count,
+            "rollout/position_reward_sum": position_reward_sum,
+            "rollout/keyframe_reward_sum": keyframe_reward_sum,
+            "rollout/iteration": self.iteration,
+        }
+        for keyframe_idx in range(2):
+            for grid_idx in range(5):
+                wandb_dir[f"rollout/action_{keyframe_idx}_{grid_idx}_count"] = int(
+                    action_counts[keyframe_idx, grid_idx]
+                )
+        local_rollout = dict(wandb_dir)
+        local_rollout["event"] = "rollout"
+        local_rollout["rms_checksum"] = self._rms_checksum()
+        self._write_local_metrics(local_rollout)
         if self.wandb_logging:
-            nr_valid_states = rollout_buffer.valid_mask.sum()
-            wandb_dir = {
-                "rollout/sum_reward": rollout_buffer.rewards.sum(),
-                "rollout/sum_valid_stages": nr_valid_states,
-                "rollout/ratio_valid_stages": nr_valid_states / float(rollout_buffer.valid_mask.size),
-                "rollout/mean_keyframes": (rollout_buffer.actions[:, :, 0] * rollout_buffer.valid_mask[:, :]).sum() / nr_valid_states,
-                "rollout/iteration": self.iteration,
-            }
             self.wandb_run.log(wandb_dir)
 
 
@@ -425,6 +498,18 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             for i_dict, (key, value) in enumerate(eval_rewards_dict.items()):
                 wandb_dir["eval/mean_" + key] = (value / (nr_samples_traj + 1e-9)).mean()
             self.wandb_run.log(wandb_dir)
+
+        local_eval = {
+            "event": "official_partial_eval",
+            "eval/mean_summed_reward": float(eval_reward.mean()),
+            "eval/sum_valid_stages": float(eval_valid_stages.sum()),
+            "eval/ratio_valid_stages": float(eval_valid_stages.sum() / max(nr_samples_traj.sum(), 1)),
+            "eval/mean_keyframes": float(mean_keyframe_traj.mean()),
+            "eval/mean_first_subtrajectory_ate": float(ate_traj.mean()),
+            "eval/mean_first_seq_valid_stages": float(first_subtraj_mask.sum(1).mean()),
+            "eval/rms_checksum": self._rms_checksum(),
+        }
+        self._write_local_metrics(local_eval)
 
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:

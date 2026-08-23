@@ -1,0 +1,62 @@
+experiment: rlvo_official_euroc_v101_overfit
+sequence: V1_01_easy
+camera: cam0_left_mono
+base_commit: f45d2bc63d37de6ea56e2a045788225b2c08a4ea
+official_upstream_algorithm_commit: c273182857fdef3d91eccd6bde3d78b551de21bb
+
+scientific_constants:
+  algorithm: PPO
+  action_space: "MultiDiscrete([2,5]): keyframe={0,1}, grid_size={20,25,30,35,40}"
+  actor_observation_dim: 564
+  critic_privileged_dim: 7
+  reward:
+    align_reward: 0.01
+    keyframe_reward: 0.0001
+    traj_length: 5
+    nr_points_for_align: 3
+  ppo:
+    n_envs: 100
+    n_steps: 250
+    batch_size: 25000
+    n_epochs: 10
+    gamma: 0.6
+    gae_lambda: 0.95
+    ent_coef: 0.0025
+    vf_coef: 0.5
+    max_grad_norm: 0.5
+    clip_range: 0.2
+    learning_rate: "linear 3e-4 -> 3e-5"
+
+bounded_budget:
+  iterations: 100
+  total_raw_env_steps: 2500000
+  full_v101_eval_iterations: [0, 10, 50, 100]
+  walltime_per_seed: "12:00:00"
+  seeds: [23, 47, 71]
+
+p1_controls:
+  - native_svo_heuristic
+  - all_10_fixed_legal_actions
+  - untrained_seed23_deterministic
+  - untrained_seed23_stochastic
+
+primary_metrics:
+  - training_reward_per_valid_transition
+  - full_route_sim3_ate_translation_rmse_m
+  - full_route_sim3_rpe_translation_rmse_m
+  - full_route_sim3_rpe_rotation_rmse_deg
+  - tracking_coverage
+  - monocular_scale
+
+gate:
+  infrastructure_only:
+    - exact_camera_timestamp_delivery
+    - requested_executed_action_match_when_applied
+    - failure_restart_is_sequence_frame_zero
+    - all_controls_finish_with_finite_telemetry
+  scientific_outcomes_do_not_block_seed_jobs: true
+
+stop_rule: >-
+  Stop after the pre-registered 2.5M-step results for all three seeds. Do not
+  tune reward, network, action, RMS, PPO hyperparameters, or checkpoint choice
+  in response to these results.

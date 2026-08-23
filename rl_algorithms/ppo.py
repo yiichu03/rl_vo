@@ -1,3 +1,4 @@
+import os
 import warnings
 from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union
 
@@ -180,16 +181,26 @@ class PPO(OnPolicyAlgorithm):
         self.wandb_group = wandb_group
         if self.wandb_logging:
             tags = ['Seed: {}'.format(seed)]
-            if self.wandb_tag is not None and self.wandb_tag is not '':
+            if self.wandb_tag is not None and self.wandb_tag != '':
                 tags.append(self.wandb_tag)
 
-            agent_dict_config = omegaconf.OmegaConf.to_container(self.config.agent, resolve=True, throw_on_missing=True)
-            self.wandb_run = wandb.init(entity="<entity>",
-                                        project="vo_rl",
-                                        dir=log_dir,
-                                        tags=tags,
-                                        group=self.wandb_group,
-                                        config=agent_dict_config)
+            agent_dict_config = None
+            if self.config is not None and hasattr(self.config, "agent"):
+                agent_dict_config = omegaconf.OmegaConf.to_container(
+                    self.config.agent, resolve=True, throw_on_missing=True
+                )
+            try:
+                self.wandb_run = wandb.init(
+                    entity=os.environ.get("WANDB_ENTITY") or None,
+                    project=os.environ.get("WANDB_PROJECT", "rl-vo-euroc-v101"),
+                    dir=log_dir,
+                    tags=tags,
+                    group=self.wandb_group,
+                    config=agent_dict_config,
+                )
+            except Exception as exc:
+                warnings.warn(f"W&B initialization failed; continuing with local JSONL metrics: {exc}")
+                self.wandb_logging = False
 
     def _setup_model(self) -> None:
         super()._setup_model()
@@ -312,17 +323,18 @@ class PPO(OnPolicyAlgorithm):
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
-        if self.wandb_logging and train_iter>0:
-            log_dict = {"train/entropy_loss": np.mean(entropy_losses),
-                        "train/policy_gradient_loss": np.mean(pg_losses),
-                        "train/value_loss": np.mean(value_losses),
-                        "train/approx_kl": np.mean(approx_kl_divs),
-                        "train/clip_fraction": np.mean(clip_fractions),
-                        "train/loss": loss.item(),
-                        "train/explained_variance": explained_var,
-                        "train/n_updates": self._n_updates,
-                        "train/clip_range": clip_range,
-                        "train/iteration": self.iteration,
+        if train_iter > 0:
+            log_dict = {"train/entropy_loss": float(np.mean(entropy_losses)),
+                        "train/policy_gradient_loss": float(np.mean(pg_losses)),
+                        "train/value_loss": float(np.mean(value_losses)),
+                        "train/approx_kl": float(np.mean(approx_kl_divs)),
+                        "train/clip_fraction": float(np.mean(clip_fractions)),
+                        "train/loss": float(loss.item()),
+                        "train/explained_variance": float(explained_var),
+                        "train/n_updates": int(self._n_updates),
+                        "train/clip_range": float(clip_range),
+                        "train/iteration": int(self.iteration),
+                        "train/learning_rate": float(self.policy.optimizer.param_groups[0]["lr"]),
                         }
             if hasattr(self.policy, "log_std"):
                 log_dict["train/std"] = th.exp(self.policy.log_std).mean().item()
@@ -330,7 +342,20 @@ class PPO(OnPolicyAlgorithm):
             if self.clip_range_vf is not None:
                 log_dict["train/clip_range_vf"] = clip_range_vf
 
-            self.wandb_run.log(log_dict)
+            local_train = dict(log_dict)
+            local_train["event"] = "train"
+            self._write_local_metrics(local_train)
+            if self.wandb_logging:
+                self.wandb_run.log(log_dict)
+        else:
+            self._write_local_metrics(
+                {
+                    "event": "train",
+                    "train/skipped": True,
+                    "train/reason": "no_valid_transitions",
+                    "train/iteration": self.iteration,
+                }
+            )
 
 
     def learn(

@@ -28,10 +28,14 @@ from env.utils.running_mean_std import RunningMeanStd
 class VecSVOEnv(VecEnv):
     """Custom Environment that follows gym interface."""
     def __init__(self, params_yaml_path, calib_yaml_path, dataset_dir, num_envs, mode, reward_config,
-                 initialize_glog=False, val_traj_ids=None, dataset='tartanair'):
+                 initialize_glog=False, val_traj_ids=None, dataset='tartanair',
+                 dataset_traj_name=None, restart_failed_from_sequence_start=False):
         self.num_envs = num_envs
         self.mode = mode
         self.val_traj_ids = val_traj_ids
+        self.dataset = dataset
+        self.dataset_traj_name = dataset_traj_name
+        self.restart_failed_from_sequence_start = bool(restart_failed_from_sequence_start)
 
         self.reward_coefficients = {
             'align_reward': reward_config.align_reward,
@@ -56,6 +60,8 @@ class VecSVOEnv(VecEnv):
                                             np.ones(self.obs_dim) * np.Inf,
                                             dtype=np.float64)
         self.timestamps = np.zeros([self.num_envs], dtype=np.float64)
+        self.timestamps_from_dataloader = False
+        self.frame_indices = -np.ones([self.num_envs], dtype=int)
         self.env_steps = np.zeros([self.num_envs], dtype='int')
         self.positions = np.zeros([self.num_envs, self.reward_traj_length, 3])
         self.gt_positions = np.zeros([self.num_envs, self.reward_traj_length, 3])
@@ -73,7 +79,13 @@ class VecSVOEnv(VecEnv):
         if dataset == 'tartanair':
             self.dataloader = TartanLoader(dataset_dir, self.mode, self.num_envs, self.val_traj_ids)
         elif dataset == 'euroc':
-            self.dataloader = EurocLoader(dataset_dir, self.mode, self.num_envs, self.val_traj_ids)
+            self.dataloader = EurocLoader(
+                dataset_dir,
+                self.mode,
+                self.num_envs,
+                self.val_traj_ids,
+                traj_name=self.dataset_traj_name,
+            )
         elif dataset == 'tum':
             self.dataloader = TumLoader(dataset_dir, self.mode, self.num_envs, self.val_traj_ids)
         self.dataloader_iter = iter(self.dataloader)
@@ -87,6 +99,15 @@ class VecSVOEnv(VecEnv):
             self.dataloader_iter = iter(self.dataloader)
             batch = next(self.dataloader_iter)
 
+        if len(batch) == 4:
+            images, gt_poses, new_seq, timestamps = batch
+            self.timestamps = np.ascontiguousarray(timestamps, dtype=np.float64)
+            self.timestamps_from_dataloader = True
+            if hasattr(self.dataloader, 'last_batch_indices'):
+                self.frame_indices = np.asarray(self.dataloader.last_batch_indices, dtype=int).copy()
+            return images, gt_poses, new_seq
+
+        self.timestamps_from_dataloader = False
         return batch
 
     def svo_step(self, images, action, timestamps, use_RL_actions, use_gt_init_poses, gt_init_poses=None):
@@ -99,7 +120,12 @@ class VecSVOEnv(VecEnv):
         if not use_gt_init_poses.any():
             gt_init_poses = -np.ones([self.num_envs, 7], dtype=np.float64)
 
-        use_gt_init_poses = use_gt_init_poses.astype(np.float64)
+        images = np.ascontiguousarray(images, dtype=np.uint8)
+        action = np.ascontiguousarray(action, dtype=np.float64)
+        timestamps = np.ascontiguousarray(timestamps, dtype=np.float64)
+        use_RL_actions = np.ascontiguousarray(use_RL_actions, dtype=np.float64)
+        use_gt_init_poses = np.ascontiguousarray(use_gt_init_poses, dtype=np.float64)
+        gt_init_poses = np.ascontiguousarray(gt_init_poses, dtype=np.float64)
         self.env.step(images, timestamps, action, use_RL_actions, poses, observations, dones, stages, runtime,
                       use_gt_init_poses, gt_init_poses)
 
@@ -108,19 +134,31 @@ class VecSVOEnv(VecEnv):
         return poses, observations, dones
 
     def step(self, action, use_RL_actions_bool=True, use_gt_initialization=False):
-        action = action.astype(np.float64)
-        action = self.action_space_scale[None, :, 0] * action + self.action_space_scale[None, :, 1]
+        requested_action = np.ascontiguousarray(action, dtype=np.float64)
+        action = self.action_space_scale[None, :, 0] * requested_action + self.action_space_scale[None, :, 1]
 
         images, gt_poses, new_seq = self.get_images_pose()
         gt_poses, next_poses = self.extract_next_poses(gt_poses)
 
-        info = [{'new_seq': bool(new_seq[i])} for i in range(self.num_envs)]
+        info = [
+            {
+                'new_seq': bool(new_seq[i]),
+                'frame_index': int(self.frame_indices[i]),
+                'timestamp_nsec': float(self.timestamps[i]),
+                'requested_action': requested_action[i].astype(int).tolist(),
+                'requested_action_scaled': action[i].tolist(),
+            }
+            for i in range(self.num_envs)
+        ]
         if new_seq.sum() != 0:
             self.reset_new_seq(new_seq, info)
 
         use_RL_actions, use_gt_init_poses = self.create_options(use_RL_actions_bool, use_gt_initialization)
         poses, observations, svo_dones = self.svo_step(images, action, self.timestamps, use_RL_actions,
                                                        use_gt_init_poses, gt_init_poses=gt_poses)
+        action_stages = self.svo_stages.copy()
+        action_observations = observations.copy()
+        action_poses = poses.copy()
 
         # SVO Step
         if svo_dones.sum() > 0:
@@ -130,7 +168,8 @@ class VecSVOEnv(VecEnv):
         dones = np.logical_or(svo_dones, new_seq)
 
         self.step_idx += 1
-        self.timestamps += self.delta_time
+        if not self.timestamps_from_dataloader:
+            self.timestamps += self.delta_time
 
         svo_valid_stage = self.svo_stages == 2
         valid_stages = np.logical_and(svo_valid_stage, self.prev_svo_valid_stage)
@@ -141,6 +180,20 @@ class VecSVOEnv(VecEnv):
 
         reward, info, position_error = self.compute_reward(dones, poses, gt_poses, svo_dones, valid_stages, info, action)
 
+        for i in range(self.num_envs):
+            executed = action[i].tolist() if bool(use_RL_actions[i]) else None
+            info[i]['action_applied'] = bool(use_RL_actions[i])
+            info[i]['executed_action_scaled'] = executed
+            info[i]['actual_feature_count'] = float(action_observations[i, 0])
+            info[i]['actual_keyframe_selected'] = bool(
+                action_stages[i] == 2 and np.isclose(action_observations[i, 1], 0.0)
+            )
+            info[i]['action_stage'] = int(action_stages[i])
+            info[i]['tracking_failure'] = bool(svo_dones[i])
+            info[i]['termination'] = bool(dones[i])
+            if bool(svo_dones[i]):
+                info[i]['terminal_pose_matrix'] = action_poses[i].tolist()
+
         # Critique observations
         observations = self.filter_observations(svo_valid_stage, observations)
         observations = self.add_critique_observations(observations, gt_poses, next_poses, position_error)
@@ -150,21 +203,32 @@ class VecSVOEnv(VecEnv):
 
         if self.mode == 'val':
             for i in range(self.num_envs):
-                pred_rot = Rotation.from_matrix(poses[i, :].reshape([-1, 4, 4]).swapaxes(-1, -2)[:, :3, :3])
-                info[i]['position'] = poses[i, -4:-1]
-                info[i]['rotation'] = pred_rot.as_quat()
+                pose_rotations = action_poses[i, :].reshape([-1, 4, 4]).swapaxes(-1, -2)[:, :3, :3]
+                try:
+                    pred_quaternion = Rotation.from_matrix(pose_rotations).as_quat()
+                except ValueError:
+                    pred_quaternion = np.full([pose_rotations.shape[0], 4], np.nan)
+                info[i]['position'] = action_poses[i, -4:-1]
+                info[i]['rotation'] = pred_quaternion
                 info[i]['gt_position'] = gt_poses[i, :3]
                 info[i]['gt_rotation'] = gt_poses[i, 3:]
                 info[i]['image'] = images[i, :, :, :]
-                info[i]['vo_stages'] = self.svo_stages[i]
+                info[i]['vo_stages'] = action_stages[i]
 
         return observations, reward, dones, info, valid_stages
 
     def reset_dones(self, dones, images, action, poses, observations, info, use_gt_initialization, gt_init_poses=None):
         dones_mask = dones.astype("bool")
         nr_resets = int(dones.sum())
-        reset_idx = np.nonzero(dones_mask)[0].astype(np.float64)
-        self.env.reset(reset_idx)
+        if nr_resets == 0:
+            return poses, observations, info
+
+        reset_idx_flat = np.nonzero(dones_mask)[0].astype(np.float64)
+        if self.last_observations is not None:
+            for env_id in np.flatnonzero(dones_mask):
+                info[env_id]['terminal_observation'] = self.last_observations[env_id, :].copy()
+
+        self.env.reset(reset_idx_flat)
         self.timestamps[dones_mask] = 0
         self.env_steps[dones_mask] = 0
         self.positions[dones_mask, :, :] = 0
@@ -172,42 +236,69 @@ class VecSVOEnv(VecEnv):
         self.positions_scale[dones_mask, :, :] = 0
         self.gt_positions_scale[dones_mask, :, :] = 0
         self.scale_buffer[dones_mask, :] = 0
+        reset_images = images[dones_mask, :, :, :]
+        reset_action = action[dones_mask]
+        reset_timestamps = self.timestamps[dones_mask]
+        reset_gt_init_poses = gt_init_poses[dones_mask] if gt_init_poses is not None else None
+
+        if self.restart_failed_from_sequence_start:
+            if not hasattr(self.dataloader, 'reset_envs'):
+                raise RuntimeError('The selected dataloader cannot restart failed slots from sequence start')
+            reset_batch = self.dataloader.reset_envs(dones_mask)
+            reset_images, reset_gt_batch, _, reset_timestamps = reset_batch
+            if self.mode == 'train' and reset_gt_batch.ndim == 3:
+                reset_gt_init_poses = reset_gt_batch[:, 0, :]
+            else:
+                reset_gt_init_poses = reset_gt_batch
+            self.timestamps[dones_mask] = reset_timestamps
+            for out_idx, env_id in enumerate(np.flatnonzero(dones_mask)):
+                info[env_id]['reset_to_sequence_start'] = True
+                info[env_id]['reset_frame_index'] = 0
+                info[env_id]['reset_timestamp_nsec'] = float(reset_timestamps[out_idx])
+
+        reset_idx = np.ascontiguousarray(reset_idx_flat.reshape(-1, 1), dtype=np.float64)
+        reset_images = np.ascontiguousarray(reset_images, dtype=np.uint8)
+        reset_timestamps = np.ascontiguousarray(np.asarray(reset_timestamps).reshape(-1, 1), dtype=np.float64)
+        reset_action = np.ascontiguousarray(reset_action, dtype=np.float64)
         reset_poses = np.zeros([nr_resets, 16], dtype=np.float64)
         reset_observations = np.zeros([nr_resets, self.agent_obs_dim], dtype=np.float64)
-        reset_dones_array = np.zeros([nr_resets], dtype=np.float64)
-        reset_stages = np.zeros([nr_resets], dtype=np.float64)
-        reset_runtime = np.zeros([nr_resets], dtype=np.float64)
-        reset_use_RL_actions = np.zeros([nr_resets], dtype=np.float64)
-        if not use_gt_initialization:
-            use_gt_init_poses = np.zeros([self.num_envs], dtype=np.float64)
-            gt_init_poses = -np.ones([self.num_envs, 7], dtype=np.float64)
+        reset_dones_array = np.zeros([nr_resets, 1], dtype=np.float64)
+        reset_stages = np.zeros([nr_resets, 1], dtype=np.float64)
+        reset_runtime = np.zeros([nr_resets, 1], dtype=np.float64)
+        reset_use_RL_actions = np.zeros([nr_resets, 1], dtype=np.float64)
+        if not use_gt_initialization or reset_gt_init_poses is None:
+            reset_use_gt_init_poses = np.zeros([nr_resets, 1], dtype=np.float64)
+            reset_gt_init_poses = -np.ones([nr_resets, 7], dtype=np.float64)
         else:
-            use_gt_init_poses = np.zeros([self.num_envs], dtype=np.float64)
-            use_gt_init_poses[dones_mask] = True
+            reset_use_gt_init_poses = np.ones([nr_resets, 1], dtype=np.float64)
+            reset_gt_init_poses = np.ascontiguousarray(reset_gt_init_poses, dtype=np.float64)
 
         self.env.env_step(reset_idx,
-                          images[dones_mask, :, :, :],
-                          self.timestamps[dones_mask],
-                          action[dones_mask],
+                          reset_images,
+                          reset_timestamps,
+                          reset_action,
                           reset_use_RL_actions,
                           reset_poses,
                           reset_observations,
                           reset_dones_array,
                           reset_stages,
                           reset_runtime,
-                          use_gt_init_poses,
-                          gt_init_poses)
+                          reset_use_gt_init_poses,
+                          reset_gt_init_poses)
 
         poses[dones_mask] = reset_poses
         observations[dones_mask] = reset_observations
-        self.svo_stages[dones_mask] = reset_stages.astype('int')
+        self.svo_stages[dones_mask] = reset_stages.reshape(-1).astype('int')
 
         return poses, observations, info
 
     def reset(self, seed=None, options=None, use_gt_initialization=False):
         self.env.reset(np.arange(self.num_envs).astype(np.float64))
-        if self.mode == 'val':
+        if hasattr(self.dataloader, 'set_up_running_indices'):
             self.dataloader.set_up_running_indices()
+
+        self.timestamps[:] = 0
+        self.frame_indices[:] = -1
 
         images, gt_poses, new_seq = self.get_images_pose()
         gt_poses, next_poses = self.extract_next_poses(gt_poses)
@@ -228,7 +319,8 @@ class VecSVOEnv(VecEnv):
         observations = self.normalize_obs(observations)
 
         self.prev_svo_valid_stage = svo_valid_stage
-        self.timestamps[:] += self.delta_time
+        if not self.timestamps_from_dataloader:
+            self.timestamps[:] += self.delta_time
         self.env_steps[:] = 0
         self.positions[:, :, :] = 0
         self.gt_positions[:, :, :] = 0
@@ -251,10 +343,12 @@ class VecSVOEnv(VecEnv):
         self.gt_positions_scale[new_seq_mask, :, :] = 0
         self.scale_buffer[new_seq_mask, :] = 0
         self.svo_stages[new_seq] = 1  # SVO state initialization
+        self.prev_svo_valid_stage[new_seq_mask] = False
 
         for i in range(nr_resets):
             env_id = int(reset_idx[i])
-            info[env_id]['terminal_observation'] = self.last_observations[env_id, :]
+            if self.last_observations is not None:
+                info[env_id]['terminal_observation'] = self.last_observations[env_id, :]
 
         return info
 

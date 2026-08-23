@@ -1,0 +1,83 @@
+#!/bin/bash
+#PBS -P CFP04-SF-109
+#PBS -N rlvo_v101_seed
+#PBS -q auto
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120GB
+#PBS -l walltime=12:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+SOURCE_ROOT="${RLVO_SOURCE_ROOT:?Set RLVO_SOURCE_ROOT}"
+ASSET_ROOT="${RLVO_ASSET_ROOT:-/scratch/e1538633/liuyi/vio_rl_project/vio_rl}"
+EXPECTED_COMMIT="${RLVO_EXPECTED_COMMIT:?Set RLVO_EXPECTED_COMMIT}"
+BUILD_DIR="${RLVO_BUILD_DIR:?Set RLVO_BUILD_DIR to the P1 build}"
+GATE_JSON="${RLVO_GATE_JSON:?Set RLVO_GATE_JSON to the P1 artifact}"
+SEED="${RLVO_SEED:?Set RLVO_SEED}"
+OUT_ROOT="${RLVO_OUT_ROOT:-${ASSET_ROOT}/outputs/hpc/rl_vo/euroc_v101_official}"
+JOB_TAG="${PBS_JOBID:-manual}"
+JOB_TAG="${JOB_TAG%%.*}"
+OUT_DIR="${OUT_ROOT}/seed${SEED}_${JOB_TAG}"
+LOG_DIR="${ASSET_ROOT}/outputs/hpc/logs"
+LOG="${LOG_DIR}/rlvo_v101_seed${SEED}.${PBS_JOBID:-manual}.log"
+RUNNER="${ASSET_ROOT}/scripts/hpc/run_in_openvins_container.sh"
+PY_PACKAGES="${ASSET_ROOT}/.hpc_env/python/rlvo_train_cuda_pkgs"
+
+mkdir -p "$OUT_DIR" "$LOG_DIR"
+
+{
+  echo "date_start=$(date -Is)"
+  echo "hostname=$(hostname)"
+  echo "pbs_jobid=${PBS_JOBID:-manual}"
+  echo "purpose=bounded official PPO V101 overfit seed $SEED plus preregistered full Sim3 evaluations"
+  echo "resources=1 GPU, 12 CPU, 120GB, 12h"
+  echo "budget=100 updates x 100 env x 250 steps = 2.5M raw environment steps"
+  echo "gate=requires P1 passed; stop after iterations 0,10,50,100 evaluation; no automatic tuning"
+  echo "source_root=$SOURCE_ROOT"
+  echo "build_dir=$BUILD_DIR"
+  echo "gate_json=$GATE_JSON"
+  echo "out_dir=$OUT_DIR"
+  test "$SEED" = 23 -o "$SEED" = 47 -o "$SEED" = 71
+  test "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" = "$EXPECTED_COMMIT"
+  test -z "$(git -C "$SOURCE_ROOT" status --short)"
+  test -f "$GATE_JSON"
+  test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$GATE_JSON")" = passed
+  test -f "$BUILD_DIR/svo_env/svo_env.cpython-310-x86_64-linux-gnu.so"
+  git -C "$SOURCE_ROOT" log -1 --oneline
+  nvidia-smi || true
+
+  BUILD_LIBRARY_PATH="$(find "$BUILD_DIR" -name '*.so*' -printf '%h\n' | sort -u | paste -sd: -)"
+  test -n "$BUILD_LIBRARY_PATH"
+  RUNTIME_PYTHONPATH="$PY_PACKAGES:$BUILD_DIR/svo_env:$SOURCE_ROOT"
+  RUNTIME_LD_LIBRARY_PATH="$SOURCE_ROOT/svo-lib/opengv/lib:$BUILD_LIBRARY_PATH:/.singularity.d/libs"
+
+  VIO_RL_SINGULARITY_NV=1 "$RUNNER" env \
+    PYTHONPATH="$RUNTIME_PYTHONPATH" \
+    LD_LIBRARY_PATH="$RUNTIME_LD_LIBRARY_PATH" \
+    WANDB_MODE="${RLVO_WANDB_MODE:-offline}" \
+    RLVO_EXPECTED_COMMIT="$EXPECTED_COMMIT" \
+    WANDB_PROJECT="${RLVO_WANDB_PROJECT:-rl-vo-euroc-v101}" \
+    WANDB_DIR="$OUT_DIR" \
+    RLVO_SVO_NUM_THREADS=8 \
+    RLVO_IMAGE_LOAD_NUM_THREADS=8 \
+    OMP_NUM_THREADS=8 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENCV_FOR_THREADS_NUM=1 \
+    python3 "$SOURCE_ROOT/experiments/euroc_v101_official/run.py" train \
+      --seed "$SEED" \
+      --output-dir "$OUT_DIR" \
+      --gate-json "$GATE_JSON" \
+      --expected-commit "$EXPECTED_COMMIT" \
+      --wandb-mode "${RLVO_WANDB_MODE:-offline}" \
+      --wandb-project "${RLVO_WANDB_PROJECT:-rl-vo-euroc-v101}" \
+      --wandb-group official-ppo-v101-overfit
+
+  test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$OUT_DIR/summary.json")" = complete
+  echo "summary_json=$OUT_DIR/summary.json"
+  echo "metrics_jsonl=$OUT_DIR/metrics.jsonl"
+  echo "wandb_dir=$OUT_DIR/wandb"
+  echo "date_end=$(date -Is)"
+} 2>&1 | tee "$LOG"
+
+echo "$LOG"

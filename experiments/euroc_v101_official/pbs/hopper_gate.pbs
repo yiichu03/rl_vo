@@ -1,0 +1,106 @@
+#!/bin/bash
+#PBS -P CFP04-SF-109
+#PBS -N rlvo_v101_gate
+#PBS -q auto
+#PBS -l select=1:ncpus=12:ngpus=1:mem=120GB
+#PBS -l walltime=06:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+SOURCE_ROOT="${RLVO_SOURCE_ROOT:?Set RLVO_SOURCE_ROOT}"
+ASSET_ROOT="${RLVO_ASSET_ROOT:-/scratch/e1538633/liuyi/vio_rl_project/vio_rl}"
+EXPECTED_COMMIT="${RLVO_EXPECTED_COMMIT:?Set RLVO_EXPECTED_COMMIT}"
+BUILD_DIR="${RLVO_BUILD_DIR:-${ASSET_ROOT}/.hpc_env/build/rlvo_official_euroc_${EXPECTED_COMMIT:0:12}}"
+OUT_ROOT="${RLVO_OUT_ROOT:-${ASSET_ROOT}/outputs/hpc/rl_vo/euroc_v101_official}"
+JOB_TAG="${PBS_JOBID:-manual}"
+JOB_TAG="${JOB_TAG%%.*}"
+OUT_DIR="${OUT_ROOT}/p1_${JOB_TAG}"
+LOG_DIR="${ASSET_ROOT}/outputs/hpc/logs"
+LOG="${LOG_DIR}/rlvo_v101_gate.${PBS_JOBID:-manual}.log"
+RUNNER="${ASSET_ROOT}/scripts/hpc/run_in_openvins_container.sh"
+PY_PACKAGES="${ASSET_ROOT}/.hpc_env/python/rlvo_train_cuda_pkgs"
+
+mkdir -p "$OUT_DIR" "$LOG_DIR" "$BUILD_DIR"
+
+{
+  echo "date_start=$(date -Is)"
+  echo "hostname=$(hostname)"
+  echo "pbs_jobid=${PBS_JOBID:-manual}"
+  echo "purpose=P1 build, unit/integration tests, exact timestamp/action gate, and 13 full V101 controls"
+  echo "resources=1 GPU, 12 CPU, 120GB, 6h"
+  echo "gate=mechanics only; scientific control quality does not block seed jobs"
+  echo "source_root=$SOURCE_ROOT"
+  echo "asset_root=$ASSET_ROOT"
+  echo "build_dir=$BUILD_DIR"
+  echo "out_dir=$OUT_DIR"
+  test "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" = "$EXPECTED_COMMIT"
+  test -z "$(git -C "$SOURCE_ROOT" status --short)"
+  git -C "$SOURCE_ROOT" log -1 --oneline
+  nvidia-smi || true
+
+  "$RUNNER" cmake -S "$SOURCE_ROOT/svo-lib" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
+  "$RUNNER" cmake --build "$BUILD_DIR" --target svo_env --parallel 12
+
+  BUILD_LIBRARY_PATH="$(find "$BUILD_DIR" -name '*.so*' -printf '%h\n' | sort -u | paste -sd: -)"
+  test -n "$BUILD_LIBRARY_PATH"
+  RUNTIME_PYTHONPATH="$PY_PACKAGES:$BUILD_DIR/svo_env:$SOURCE_ROOT"
+  RUNTIME_LD_LIBRARY_PATH="$SOURCE_ROOT/svo-lib/opengv/lib:$BUILD_LIBRARY_PATH:/.singularity.d/libs"
+
+  VIO_RL_SINGULARITY_NV=1 "$RUNNER" env \
+    PYTHONPATH="$RUNTIME_PYTHONPATH" \
+    LD_LIBRARY_PATH="$RUNTIME_LD_LIBRARY_PATH" \
+    WANDB_MODE=disabled \
+    RLVO_EXPECTED_COMMIT="$EXPECTED_COMMIT" \
+    RLVO_SVO_NUM_THREADS=8 \
+    RLVO_IMAGE_LOAD_NUM_THREADS=8 \
+    OMP_NUM_THREADS=8 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENCV_FOR_THREADS_NUM=1 \
+    python3 -m py_compile \
+      "$SOURCE_ROOT/dataloader/euroc_loader.py" \
+      "$SOURCE_ROOT/env/svo_wrapper.py" \
+      "$SOURCE_ROOT/experiments/euroc_v101_official/run.py"
+
+  VIO_RL_SINGULARITY_NV=1 "$RUNNER" env \
+    PYTHONPATH="$RUNTIME_PYTHONPATH" \
+    LD_LIBRARY_PATH="$RUNTIME_LD_LIBRARY_PATH" \
+    WANDB_MODE=disabled \
+    RLVO_EXPECTED_COMMIT="$EXPECTED_COMMIT" \
+    python3 -m pytest -q "$SOURCE_ROOT/tests/test_euroc_v101_official.py"
+
+  VIO_RL_SINGULARITY_NV=1 "$RUNNER" env \
+    PYTHONPATH="$RUNTIME_PYTHONPATH" \
+    LD_LIBRARY_PATH="$RUNTIME_LD_LIBRARY_PATH" \
+    WANDB_MODE=disabled \
+    RLVO_EXPECTED_COMMIT="$EXPECTED_COMMIT" \
+    RLVO_SVO_NUM_THREADS=8 \
+    RLVO_IMAGE_LOAD_NUM_THREADS=8 \
+    OMP_NUM_THREADS=8 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENCV_FOR_THREADS_NUM=1 \
+    python3 "$SOURCE_ROOT/experiments/euroc_v101_official/run.py" validate \
+      --output "$OUT_DIR/validate.json"
+
+  VIO_RL_SINGULARITY_NV=1 "$RUNNER" env \
+    PYTHONPATH="$RUNTIME_PYTHONPATH" \
+    LD_LIBRARY_PATH="$RUNTIME_LD_LIBRARY_PATH" \
+    WANDB_MODE=disabled \
+    RLVO_EXPECTED_COMMIT="$EXPECTED_COMMIT" \
+    RLVO_SVO_NUM_THREADS=8 \
+    RLVO_IMAGE_LOAD_NUM_THREADS=8 \
+    OMP_NUM_THREADS=8 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENCV_FOR_THREADS_NUM=1 \
+    python3 "$SOURCE_ROOT/experiments/euroc_v101_official/run.py" gate \
+      --output-dir "$OUT_DIR"
+
+  test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$OUT_DIR/gate.json")" = passed
+  echo "gate_json=$OUT_DIR/gate.json"
+  echo "date_end=$(date -Is)"
+} 2>&1 | tee "$LOG"
+
+echo "$LOG"
