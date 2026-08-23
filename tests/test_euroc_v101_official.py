@@ -6,6 +6,10 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from env import svo_wrapper
+from experiments.euroc_v101_official.assessment import (
+    build_scientific_assessment,
+    comparison_eligibility,
+)
 from experiments.euroc_v101_official.metrics import estimate_sim3, sim3_trajectory_metrics
 
 
@@ -195,3 +199,57 @@ def test_failure_action_is_logged_and_restart_is_frame_zero(monkeypatch):
     assert info["reset_frame_index"] == 0
     assert info["reset_timestamp_nsec"] == 0
     assert env.env.last_env_step_scalar_shapes == ((1, 1), (1, 1), (1, 1))
+
+
+def _assessment_row(label, ate, *, full_route, coverage, failures=0, terminations=0):
+    return {
+        "label": label,
+        "controller": "policy",
+        "sim3_ate_translation_rmse_m": ate,
+        "full_route_completed": full_route,
+        "tracking_coverage": coverage,
+        "tracking_failure_count": failures,
+        "termination_count": terminations,
+    }
+
+
+def test_truncated_low_ate_is_not_scientifically_comparable():
+    eligible, reasons = comparison_eligibility(
+        _assessment_row(
+            "short_false_positive",
+            0.003,
+            full_route=False,
+            coverage=0.02,
+            failures=1,
+            terminations=1,
+        )
+    )
+    assert not eligible
+    assert "route_not_completed" in reasons
+    assert "coverage_below_0p95" in reasons
+
+
+def test_assessment_uses_only_full_route_fixed_and_policy_results():
+    bad_fixed = _assessment_row("bad_fixed", 0.001, full_route=False, coverage=0.02)
+    bad_fixed["controller"] = "fixed"
+    good_fixed = _assessment_row("good_fixed", 0.15, full_route=True, coverage=0.97)
+    good_fixed["controller"] = "fixed"
+    raw = {
+        "controls": [bad_fixed, good_fixed],
+        "checkpoint_evaluations": {
+            "23": [
+                _assessment_row("seed23_iter0", 0.20, full_route=True, coverage=0.97),
+                _assessment_row(
+                    "seed23_iter100", 0.002, full_route=False, coverage=0.01
+                ),
+            ]
+        },
+        "seed_conclusions": {
+            "23": {"reward_curve": {"delta_last_minus_first": -0.1}}
+        },
+    }
+    assessment = build_scientific_assessment(raw)
+    assert assessment["best_eligible_fixed_by_sim3_ate"]["label"] == "good_fixed"
+    assert not assessment["any_trained_checkpoint_better_than_best_fixed"]
+    assert not assessment["scientific_success"]
+    assert assessment["verdict"] == "no_viable_trained_policy"

@@ -26,6 +26,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from dataloader.euroc_loader import EurocLoader
 from env.svo_wrapper import VecSVOEnv
+from experiments.euroc_v101_official.assessment import (
+    annotated_result,
+    build_scientific_assessment,
+    comparison_eligibility,
+)
 from experiments.euroc_v101_official.metrics import rms_checksum, sim3_trajectory_metrics
 from policies.attention_policy import CustomActorCriticPolicy
 from rl_algorithms.ppo import PPO
@@ -474,9 +479,7 @@ def command_gate(args) -> int:
     }
     gate_passed = all(gate_checks.values())
     native_summary = summaries[0]
-    finite_ates = [
-        s for s in fixed_summaries if s["sim3_ate_translation_rmse_m"] is not None
-    ]
+    finite_ates = [s for s in fixed_summaries if comparison_eligibility(s)[0]]
     best_fixed = (
         min(finite_ates, key=lambda item: item["sim3_ate_translation_rmse_m"]) if finite_ates else None
     )
@@ -631,8 +634,8 @@ def command_train(args) -> int:
         )
 
     reward_curve = _read_reward_curve(output_dir / "metrics.jsonl")
-    initial_eval = evaluations[0]
-    final_eval = evaluations[-1]
+    initial_eval = annotated_result(evaluations[0])
+    final_eval = annotated_result(evaluations[-1])
     aggregate = {
         "status": "complete",
         "seed": args.seed,
@@ -645,11 +648,17 @@ def command_train(args) -> int:
             and reward_curve["delta_last_minus_first"] > 0
         ),
         "final_ate_better_than_initial": (
-            final_eval["sim3_ate_translation_rmse_m"] is not None
-            and initial_eval["sim3_ate_translation_rmse_m"] is not None
+            initial_eval["scientific_comparison_eligible"]
+            and final_eval["scientific_comparison_eligible"]
             and final_eval["sim3_ate_translation_rmse_m"]
             < initial_eval["sim3_ate_translation_rmse_m"]
         ),
+        "initial_scientific_comparison_eligible": initial_eval[
+            "scientific_comparison_eligible"
+        ],
+        "final_scientific_comparison_eligible": final_eval[
+            "scientific_comparison_eligible"
+        ],
         "finished_unix": time.time(),
     }
     write_json(output_dir / "summary.json", aggregate)
@@ -728,41 +737,32 @@ def command_posthoc(args) -> int:
             )
         checkpoint_evaluations[str(seed)] = seed_evaluations
 
-    fixed_controls = [item for item in controls if item["controller"] == "fixed"]
-    finite_fixed = [item for item in fixed_controls if item["sim3_ate_translation_rmse_m"] is not None]
-    best_fixed = min(finite_fixed, key=lambda item: item["sim3_ate_translation_rmse_m"]) if finite_fixed else None
-    seed_conclusions = {}
-    for seed_text, evaluations in checkpoint_evaluations.items():
-        initial = evaluations[0]
-        final = evaluations[-1]
-        best_fixed_ate = best_fixed["sim3_ate_translation_rmse_m"] if best_fixed else None
-        seed_conclusions[seed_text] = {
-            "reward_curve": source_runs[seed_text].get("reward_curve"),
-            "initial_ate": initial["sim3_ate_translation_rmse_m"],
-            "final_ate": final["sim3_ate_translation_rmse_m"],
-            "final_better_than_initial": (
-                initial["sim3_ate_translation_rmse_m"] is not None
-                and final["sim3_ate_translation_rmse_m"] is not None
-                and final["sim3_ate_translation_rmse_m"] < initial["sim3_ate_translation_rmse_m"]
-            ),
-            "final_better_than_best_fixed": (
-                best_fixed_ate is not None
-                and final["sim3_ate_translation_rmse_m"] is not None
-                and final["sim3_ate_translation_rmse_m"] < best_fixed_ate
-            ),
-        }
-
     payload = {
         "status": "complete",
         "git": git_state(),
         "boundary": "frame-0 GT initialization only; no mid-sequence fresh initialization or trajectory stitching",
         "controls": controls,
-        "best_fixed_by_sim3_ate": best_fixed,
         "checkpoint_evaluations": checkpoint_evaluations,
-        "seed_conclusions": seed_conclusions,
+        "seed_conclusions": {
+            seed_text: {"reward_curve": source_runs[seed_text].get("reward_curve")}
+            for seed_text in checkpoint_evaluations
+        },
     }
+    payload["scientific_assessment"] = build_scientific_assessment(payload)
     write_json(output_dir / "summary.json", payload)
     print(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))
+    return 0
+
+
+def command_assess_posthoc(args) -> int:
+    """Correctly assess an existing post-hoc summary without rerunning SVO."""
+    summary_path = Path(args.summary_json).resolve()
+    raw_summary = json.loads(summary_path.read_text())
+    assessment = build_scientific_assessment(raw_summary)
+    assessment["source_summary_json"] = str(summary_path)
+    assessment["assessment_git"] = git_state()
+    write_json(args.output, assessment)
+    print(json.dumps(assessment, indent=2, sort_keys=True, default=_json_default))
     return 0
 
 
@@ -822,6 +822,11 @@ def parse_args():
         help="Repeat three times as SEED=/absolute/training/run/directory",
     )
     posthoc_parser.set_defaults(func=command_posthoc)
+
+    assess_parser = subparsers.add_parser("assess-posthoc")
+    assess_parser.add_argument("--summary-json", required=True)
+    assess_parser.add_argument("--output", required=True)
+    assess_parser.set_defaults(func=command_assess_posthoc)
     return parser.parse_args()
 
 

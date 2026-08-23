@@ -69,3 +69,7 @@ not an infrastructure failure. Seeds are submitted with `afterok` on P1.
 Local `metrics.jsonl`, checkpoint RMS files/checksums, per-frame compressed
 traces, and summary JSON files are the source of truth. W&B runs default to
 offline mode so network or credentials cannot invalidate an experiment.
+
+The completed three-seed result and stop decision are recorded in
+[`RESULTS.md`](RESULTS.md).  Scientific comparisons exclude any truncated
+trajectory regardless of how small its prefix-only ATE appears.
