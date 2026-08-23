@@ -48,6 +48,11 @@ primary_metrics:
   - tracking_coverage
   - monocular_scale
 
+initialization_contract:
+  scientific_controls_and_policy_eval: gt_pose_at_sequence_frame_zero_only
+  diagnostic: cold_mono_native
+  forbidden: mid_sequence_fresh_initialization_or_subtrajectory_stitching
+
 gate:
   infrastructure_only:
     - exact_camera_timestamp_delivery

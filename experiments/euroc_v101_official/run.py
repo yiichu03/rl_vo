@@ -161,6 +161,7 @@ def evaluate_controller(
     deterministic: bool = True,
     checkpoint: str | Path | None = None,
     rms_path: str | Path | None = None,
+    gt_initialize_at_frame0: bool = False,
 ):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -172,7 +173,7 @@ def evaluate_controller(
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    obs = env.reset(use_gt_initialization=False)
+    obs = env.reset(use_gt_initialization=gt_initialize_at_frame0)
     sequence_length = env.dataloader.sequence_length(0)
     expected_timestamps = env.dataloader.get_timestamps_nsec(args.sequence)
     records = []
@@ -293,6 +294,7 @@ def evaluate_controller(
         "checkpoint": str(checkpoint) if checkpoint is not None else None,
         "rms_path": str(rms_path) if rms_path is not None else None,
         "rms_checksum": rms_checksum(rms_path) if rms_path is not None else None,
+        "initialization_mode": "gt_at_frame0" if gt_initialize_at_frame0 else "cold_mono",
         "sequence": args.sequence,
         "sequence_length": sequence_length,
         "processed_steps_after_reset": len(records),
@@ -403,8 +405,23 @@ def command_gate(args) -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_checks = validate_dataset(args)
+    cold_native = evaluate_controller(
+        args,
+        output_dir / "cold_start_diagnostic/native",
+        "cold_start_native",
+        "native",
+        gt_initialize_at_frame0=False,
+    )
     summaries = []
-    summaries.append(evaluate_controller(args, output_dir / "controls/native", "native", "native"))
+    summaries.append(
+        evaluate_controller(
+            args,
+            output_dir / "controls/native",
+            "native",
+            "native",
+            gt_initialize_at_frame0=True,
+        )
+    )
     for keyframe in range(2):
         for grid_idx, grid_size in enumerate(range(20, 41, 5)):
             label = f"fixed_kf{keyframe}_grid{grid_size}"
@@ -415,6 +432,7 @@ def command_gate(args) -> int:
                     label,
                     "fixed",
                     fixed_action=[keyframe, grid_idx],
+                    gt_initialize_at_frame0=True,
                 )
             )
     summaries.append(
@@ -425,6 +443,7 @@ def command_gate(args) -> int:
             "policy",
             seed=23,
             deterministic=True,
+            gt_initialize_at_frame0=True,
         )
     )
     summaries.append(
@@ -435,6 +454,7 @@ def command_gate(args) -> int:
             "policy",
             seed=23,
             deterministic=False,
+            gt_initialize_at_frame0=True,
         )
     )
 
@@ -467,6 +487,7 @@ def command_gate(args) -> int:
         "dataset_checks": dataset_checks,
         "gate_checks": gate_checks,
         "native": native_summary,
+        "cold_start_native_diagnostic": cold_native,
         "best_fixed_by_sim3_ate": best_fixed,
         "controls": summaries,
         "contract": str(REPO_ROOT / "experiments/euroc_v101_official/contract.yaml"),
@@ -605,6 +626,7 @@ def command_train(args) -> int:
                 deterministic=True,
                 checkpoint=checkpoint,
                 rms_path=checkpoint_rms,
+                gt_initialize_at_frame0=True,
             )
         )
 
@@ -635,6 +657,112 @@ def command_train(args) -> int:
     manifest["finished_unix"] = aggregate["finished_unix"]
     write_json(output_dir / "manifest.json", manifest)
     print(json.dumps(aggregate, indent=2, sort_keys=True, default=_json_default))
+    return 0
+
+
+def _parse_seed_run(value: str):
+    seed_text, separator, run_dir = value.partition("=")
+    if not separator:
+        raise argparse.ArgumentTypeError("Expected SEED=/absolute/run/directory")
+    seed = int(seed_text)
+    if seed not in {23, 47, 71}:
+        raise argparse.ArgumentTypeError(f"Unexpected seed: {seed}")
+    path = Path(run_dir).resolve()
+    return seed, path
+
+
+def command_posthoc(args) -> int:
+    """Re-evaluate completed old-commit runs with the corrected frame-0 contract."""
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    controls = []
+    controls.append(
+        evaluate_controller(
+            args,
+            output_dir / "controls/native",
+            "native_gt_at_frame0",
+            "native",
+            gt_initialize_at_frame0=True,
+        )
+    )
+    for keyframe in range(2):
+        for grid_idx, grid_size in enumerate(range(20, 41, 5)):
+            label = f"fixed_kf{keyframe}_grid{grid_size}_gt_at_frame0"
+            controls.append(
+                evaluate_controller(
+                    args,
+                    output_dir / "controls" / label,
+                    label,
+                    "fixed",
+                    fixed_action=[keyframe, grid_idx],
+                    gt_initialize_at_frame0=True,
+                )
+            )
+
+    checkpoint_evaluations = {}
+    source_runs = {}
+    for seed, run_dir in args.seed_run:
+        source_summary_path = run_dir / "summary.json"
+        if not source_summary_path.is_file():
+            raise FileNotFoundError(source_summary_path)
+        source_summary = json.loads(source_summary_path.read_text())
+        if source_summary.get("status") != "complete":
+            raise RuntimeError(f"Training run is incomplete: {source_summary_path}")
+        source_runs[str(seed)] = source_summary
+        seed_evaluations = []
+        for iteration in OFFICIAL["eval_iterations"]:
+            checkpoint = run_dir / "Policy" / f"iter_{iteration:05d}.pth"
+            checkpoint_rms = run_dir / "Policy" / f"iter_{iteration:05d}_rms.npz"
+            seed_evaluations.append(
+                evaluate_controller(
+                    args,
+                    output_dir / "checkpoints" / f"seed{seed}" / f"iter_{iteration:05d}",
+                    f"seed{seed}_iter{iteration}_gt_at_frame0",
+                    "policy",
+                    seed=seed,
+                    deterministic=True,
+                    checkpoint=checkpoint,
+                    rms_path=checkpoint_rms,
+                    gt_initialize_at_frame0=True,
+                )
+            )
+        checkpoint_evaluations[str(seed)] = seed_evaluations
+
+    fixed_controls = [item for item in controls if item["controller"] == "fixed"]
+    finite_fixed = [item for item in fixed_controls if item["sim3_ate_translation_rmse_m"] is not None]
+    best_fixed = min(finite_fixed, key=lambda item: item["sim3_ate_translation_rmse_m"]) if finite_fixed else None
+    seed_conclusions = {}
+    for seed_text, evaluations in checkpoint_evaluations.items():
+        initial = evaluations[0]
+        final = evaluations[-1]
+        best_fixed_ate = best_fixed["sim3_ate_translation_rmse_m"] if best_fixed else None
+        seed_conclusions[seed_text] = {
+            "reward_curve": source_runs[seed_text].get("reward_curve"),
+            "initial_ate": initial["sim3_ate_translation_rmse_m"],
+            "final_ate": final["sim3_ate_translation_rmse_m"],
+            "final_better_than_initial": (
+                initial["sim3_ate_translation_rmse_m"] is not None
+                and final["sim3_ate_translation_rmse_m"] is not None
+                and final["sim3_ate_translation_rmse_m"] < initial["sim3_ate_translation_rmse_m"]
+            ),
+            "final_better_than_best_fixed": (
+                best_fixed_ate is not None
+                and final["sim3_ate_translation_rmse_m"] is not None
+                and final["sim3_ate_translation_rmse_m"] < best_fixed_ate
+            ),
+        }
+
+    payload = {
+        "status": "complete",
+        "git": git_state(),
+        "boundary": "frame-0 GT initialization only; no mid-sequence fresh initialization or trajectory stitching",
+        "controls": controls,
+        "best_fixed_by_sim3_ate": best_fixed,
+        "checkpoint_evaluations": checkpoint_evaluations,
+        "seed_conclusions": seed_conclusions,
+    }
+    write_json(output_dir / "summary.json", payload)
+    print(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))
     return 0
 
 
@@ -682,6 +810,18 @@ def parse_args():
     train_parser.add_argument("--wandb-project", default="rl-vo-euroc-v101")
     train_parser.add_argument("--wandb-group", default="official-ppo-v101-overfit")
     train_parser.set_defaults(func=command_train)
+
+    posthoc_parser = subparsers.add_parser("posthoc")
+    add_common_arguments(posthoc_parser)
+    posthoc_parser.add_argument("--output-dir", required=True)
+    posthoc_parser.add_argument(
+        "--seed-run",
+        action="append",
+        type=_parse_seed_run,
+        required=True,
+        help="Repeat three times as SEED=/absolute/training/run/directory",
+    )
+    posthoc_parser.set_defaults(func=command_posthoc)
     return parser.parse_args()
 
 

@@ -47,6 +47,12 @@ P1 runs the loader/timestamp/action tests and then one V1_01 evaluation for:
 - all ten fixed legal RL actions;
 - the untrained seed-23 policy, deterministic and stochastic.
 
+The scientific controls and trained-policy evaluations use GT only to set the
+pose of sequence frame zero. A separate cold-start native diagnostic is kept.
+This separation is necessary because V1_01 cold monocular initialization can
+fail before the policy receives a valid action; no evaluation may initialize
+from a later frame or stitch reset subtrajectories.
+
 The gate checks mechanics only. Weak control accuracy is a scientific result,
 not an infrastructure failure. Seeds are submitted with `afterok` on P1.
 
