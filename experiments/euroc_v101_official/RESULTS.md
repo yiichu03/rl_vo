@@ -107,9 +107,12 @@ The local source of truth is under:
   posthoc_frame0_eval_580188/{summary.json,scientific_assessment.json}
 ```
 
-PBS logs are under `outputs/hpc/logs/rlvo_v101_*.hopper-m-02.log`.  W&B run
-identifiers are `b8m1zaho` (seed 23), `7r1y1n14` (seed 47), and `uq9gfcrg`
-(seed 71).
+PBS logs are under `outputs/hpc/logs/rlvo_v101_*.hopper-m-02.log`.  The offline
+runs were synchronized after all jobs finished:
+
+- [seed 23 / b8m1zaho](https://wandb.ai/yiichu03-nus/rl-vo-euroc-v101/runs/b8m1zaho)
+- [seed 47 / 7r1y1n14](https://wandb.ai/yiichu03-nus/rl-vo-euroc-v101/runs/7r1y1n14)
+- [seed 71 / uq9gfcrg](https://wandb.ai/yiichu03-nus/rl-vo-euroc-v101/runs/uq9gfcrg)
 
 ## Stop decision
 
