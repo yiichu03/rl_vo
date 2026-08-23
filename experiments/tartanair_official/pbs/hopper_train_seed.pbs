@@ -42,7 +42,9 @@ mkdir -p "$OUT_DIR" "$RUN_DIR" "$LOG_DIR"
   echo "out_dir=$OUT_DIR"
   test "$SEED" = 0 -o "$SEED" = 23
   test "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" = "$EXPECTED_COMMIT"
-  test -z "$(git -C "$SOURCE_ROOT" status --short)"
+  # PBS creates its stdout file in the submission directory before this check.
+  # Require tracked files to be clean while allowing that scheduler artifact.
+  test -z "$(git -C "$SOURCE_ROOT" status --short --untracked-files=no)"
   git -C "$SOURCE_ROOT" diff --quiet f45d2bc63d37de6ea56e2a045788225b2c08a4ea -- svo-lib
   test -f "$BUILD_DIR/svo_env/svo_env.cpython-310-x86_64-linux-gnu.so"
   git -C "$SOURCE_ROOT" log -1 --oneline

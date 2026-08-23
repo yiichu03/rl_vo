@@ -5,3 +5,4 @@ policies/__pycache__/
 rl_algorithms/__pycache__/
 __pycache__/
 .pytest_cache/
+/rlvo_ta_*.o*
