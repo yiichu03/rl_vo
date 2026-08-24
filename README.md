@@ -1,5 +1,10 @@
 # Reinforcement Learning Meets Visual Odometry
 
+> **Branch experiment:** the two-seed, 25M-step official-style TartanAir
+> reproduction is complete. The preregistered deterministic-validation result is
+> **0/2 positive seeds**. See the [experiment contract](experiments/tartanair_official/README.md)
+> and [full results](experiments/tartanair_official/RESULTS.md).
+
 <p align="center">
  <a href="https://youtu.be/pt6yPTdQd6M">
   <img src="doc/thumbnail.png" alt="youtube_video" width="800"/>

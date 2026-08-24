@@ -1,5 +1,10 @@
 # Official RL-VO TartanAir Reproduction Diagnostic
 
+> **Completed result (2026-08-24):** both 25M-step seeds finished, and the
+> preregistered deterministic-validation vote was **0/2**. See
+> [RESULTS.md](RESULTS.md) for the full result, RMS audit, limitations, and
+> implications for RL-VIO.
+
 This experiment asks whether the official RL-VO PPO loop exhibits a reproducible
 learning signal on its native TartanAir domain. It deliberately does not test an
 RL-VIO action or modify the published action, observation, reward, PPO, or online
@@ -29,8 +34,10 @@ zero-copy symlink view; source data is never rewritten or duplicated.
 Both PBS jobs run the same official 25M-step configuration and differ only by
 seed (`0` and `23`): 100 environments, 250 steps per rollout, PPO, the published
 asymmetric actor/critic, `MultiDiscrete([2,5])` keyframe/grid action, local
-Sim(3)-aligned position reward, keyframe penalty, and online RMS update every ten
-iterations. See `contract.yaml` for the exact values.
+Sim(3)-aligned position reward, keyframe penalty, and the official online RMS
+mechanism (nominal promotion every ten iterations). The completed-run audit found
+that object aliasing makes the active RMS drift between promotions; see
+`RESULTS.md`. See `contract.yaml` for the frozen values.
 
 Measurement-only additions are an iteration-0 deterministic validation, a local
 JSONL mirror of scalar W&B metrics, RMS checksums, data validation, and pybind
@@ -55,3 +62,12 @@ be read together.
 W&B defaults to offline mode so network availability cannot fail training. The
 local run directory contains `metrics.jsonl`, `Policy/` checkpoints/RMS files,
 the W&B run, the data audit, and a preregistered `summary.json` after completion.
+
+## Result status
+
+Jobs `580495` (seed 0) and `580496` (seed 23) both completed 25M steps and 101
+deterministic evaluations. Neither seed passed the frozen gate, so this branch's
+conclusion is `no_reproducible_learning_signal` under the tested official-style
+contract. This result does not isolate a single cause and does not claim that the
+published method can never learn; the precise evidence boundary is documented in
+[RESULTS.md](RESULTS.md).
